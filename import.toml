@@ -1,0 +1,1685 @@
+
+
+
+[[bqsql]]
+#************** perf_storage *******************************************
+dag_id = 'per_storage_v1'
+task_id = 'auto_approval_organic_v1'
+sql = '''
+create or replace table `noonbicompl.supply_planning.auto_approval_organic_v1` as
+with inventory_table as(
+select a.*,
+date as inventory_date
+FROM `noonbigrowth.assortment_noon.psku_sku_mapped_ae` a
+where
+a.warehouse_country = 'AE'
+and date = CURRENT_DATE() 
+union all
+select a.*,
+date as inventory_date
+FROM `noonbigrowth.assortment_noon.psku_sku_mapped_sa` a
+where
+a.warehouse_country = 'SA'
+and date = CURRENT_DATE() 
+union all
+select a.*,
+date as inventory_date
+FROM `noonbigrowth.assortment_noon.psku_sku_mapped_eg` a
+where
+a.warehouse_country = 'EG'
+and date= CURRENT_DATE() 
+),
+
+Organic_sellers as 
+(SELECT lower(country_code) as country, id_partner FROM `noonbimkpops.partner.partner_barcode_list` where account_status='Organic' and is_retail=0 
+and lower(country_code) in ('ae','sa','eg')
+group by 1,2),
+
+
+invent_table as (
+Select
+a.inventory_date,
+b.comcat_code,
+a.warehouse_country as country,
+a.id_partner,
+--avg(a.offer_price) as offer_price,
+case 
+when a.id_partner in (9303,9403,9503) then 'Grocery'
+when a.id_partner = 3001 then 'Namshi'
+when a.id_partner = 9611 then 'JVCO'
+when commercial_reporting_category  in ('apparel', 'jewelry','bags_luggage', 'footwear') and a.id_partner=rp.id_partner and whitelabel=2 then 'PL_Fashion'
+when commercial_reporting_category in ('apparel','jewelry','bags_luggage', 'footwear') and a.id_partner=rp.id_partner and a.id_partner not in (9405) and whitelabel=1 then 'White_Label'
+when commercial_reporting_category  in ('apparel', 'jewelry','bags_luggage', 'footwear') and a.id_partner=rp.id_partner then 'Retail_Fashion'
+when commercial_reporting_category  in ('apparel', 'jewelry','bags_luggage', 'footwear') then 'FBN_Fashion'
+when a.id_partner in (9200) then 'Bazaar'
+when a.id_partner in (9201) then 'Recommerce'
+when a.id_partner in (9401,9402,9406) then 'Private_Label'
+when b.sku_config in (SELECT distinct sku_config FROM `noonbipldata.private_label.product_info`)  and a.id_partner in (1,9401, 9402, 9406, 9601, 9405, 9601, 9611) then  'Private_Label'
+when a.id_partner in (1,9404,20861)  and commercial_reporting_category not in ('apparel', 'jewelry','bags_luggage', 'footwear') then 'Retail_Core'
+when commercial_reporting_category not in ('apparel', 'jewelry','bags_luggage', 'footwear')  and a.id_partner not in (1,1437,9002,9200,9201,9202,9303,9401,9402,9403,9404,9405,9503,9601,9611,20861) then 'FBN_Core' 
+else 'NA' end as Business_unit,  
+case
+when coalesce(comcat_code,commercial_reporting_category,reporting_category_parent,"Null") in ('mobiles', 'laptops','video_games') and a.warehouse_country='AE' then 'Sort'
+when coalesce(comcat_code,commercial_reporting_category,reporting_category_parent,"Null") in ('electronic_accessories', 'video_games','mobiles','laptops') and a.warehouse_country='SA' then 'Sort'
+when coalesce(comcat_code,commercial_reporting_category,reporting_category_parent,"Null") in ('apparel', 'jewelry','bags_luggage', 'footwear') and a.warehouse_country='EG' then 'Sort'
+when f.partner_code in 
+('DXB05','DXB06','DXBGFLX01','DXBG01','DXBG02','DXBG03','DXBDS02','DXBDS03','DXBDS04','DXBDS05','DXBDS06','DXBDS07','DXBDS01',
+'RUH02','RUHJCNew','RUHFLX06', 'RUHFLX05','JED01','RUH_GROCERY','RUHFLX04','RUHG01','RUHFLX06','JEDG01','RUH07','CAI04','CAI01','CAI02')
+or f.partner_code like '%FW%' or f.partner_code like '%XDOCK%' then 'Sort'
+when f.partner_code like '%BK%' then 'Bulky'
+when f.partner_code like '%B' then 'Bulky'
+when f.partner_code like '%NS' then 'Non-Sort'
+when f.partner_code like '%S' then 'Sort'
+else 'Non-Sort' end as sort_non_sort,
+sum(case when a.is_fbn=1 and a.stock_net>0 then a.stock_net end) as express_stock
+from inventory_table as a
+left join (select distinct id_partner from `noonbistratg.ref.retail_partner`)rp  on rp.id_partner=a.id_partner
+   left join `noonbigrowth.assortment_noon.catalog` b on a.sku = b.sku
+left join (select distinct brands, whitelabel  from `noonbifashn.misc.white_labels`)wl on b.brand_code=wl.brands 
+left join `noondwh.partner.partner_warehouse` f on a.warehouse_code = f.code
+group by 1,2,3,4,5,6),
+
+organic_seller_stock as 
+(select a.* from invent_table a
+inner join Organic_sellers s on a.id_partner=s.id_partner and lower(a.country)=lower(s.country)
+where express_stock>0),
+
+
+organic_seller_format as 
+(select country,id_partner, 
+sum(case when sort_non_sort ='Sort' then express_stock end) as Sort_units ,
+sum(case when sort_non_sort ='Non-Sort' then express_stock end) as Non_Sort_units ,
+sum(case when sort_non_sort ='Bulky' then express_stock end) as Bulky_units ,
+sum(express_stock ) as Total_units from 
+organic_seller_stock a
+group by 1,2),
+
+Transit_data as 
+(select
+a.asn_nr,b.id_partner,b.country, sum(asn_sku_qty)asn_sku_qty
+from 
+ (select asn_nr,sum(asn_sku_qty)  asn_sku_qty 
+from noonbigrowth.instock_noon.fbn_intransit group by 1) a
+left join `noonbigrowth.instock_noon.asn_base_dashboard`  b 
+on a.asn_nr=b.asn_nr
+group by 1,2,3 ),
+
+organic_seller_format2 as 
+(select a.*, asn_sku_qty_transit
+from organic_seller_format a
+left join (select id_partner,country,sum(asn_sku_qty) asn_sku_qty_transit from Transit_data group by 1,2) b
+on a.id_partner=b.id_partner and a.country=b.country),
+
+ASNs_id_partner_Selected_status as 
+(select id_partner,country , sum(asn_expected_qty) asn_pending_approval
+from noonbigrowth.instock_noon.asn_validation_summary
+where status_code in ('NEW','PENDING_APPROVAL')
+group by 1,2),
+
+organic_seller_format3 as 
+(select a.*, asn_pending_approval
+from organic_seller_format2 a
+left join (select id_partner,country, sum(asn_pending_approval) asn_pending_approval from ASNs_id_partner_Selected_status group by 1,2) b
+on a.id_partner=b.id_partner and a.country=b.country),
+
+
+ASn_selection_logic  as
+(select a.*,
+case when (coalesce(Total_units,0)+coalesce(asn_sku_qty_transit,0)+coalesce(asn_pending_approval,0))<3000 then 'Select' else 'Dont_select' end as ASN_Selection
+from organic_seller_format3 a ),
+
+ASNs_id_partner_Selected_status_final as 
+(select a.country,a.asn_nr ,a.id_partner,partner_name,coalesce(mapped_bu,primary_bu) as BU,
+case when primary_bu = 'CE' then 'consumer_elec'
+when primary_bu = 'Emerging Categories' then 'emerging_categ'
+when primary_bu = 'Laptops_VG' then 'Laptops_VG'
+when primary_bu = 'Home' then 'home'
+when primary_bu = 'Toys' then 'Baby'
+when primary_bu = 'Grocery' then 'Grocery'
+when primary_bu = 'Beauty' then 'Beauty'
+when primary_bu = 'Health Nutrition' then 'Beauty'
+when primary_bu = 'Fashion' then 'Fashion'
+when primary_bu = 'Baby' then 'Baby'
+when primary_bu = 'Telco' then 'Telco' else primary_bu end as BU_Mapped_New,
+mapped_bu,primary_bu,status_code,schedule_status,(coalesce(Total_units,0)+coalesce(asn_sku_qty_transit,0)+coalesce(asn_pending_approval,0)) max_qty ,sum(asn_expected_qty) asn_expected_qty 
+from noonbigrowth.instock_noon.asn_validation_summary a
+inner join (select * from ASn_selection_logic where ASN_Selection='Select'
+) b on 
+a.id_partner=b.id_partner and a.country = b.country
+where status_code in ('PENDING_APPROVAL')
+group by 1,2,3,4,5,6,7,8,9,10,11)
+
+
+select * from ASNs_id_partner_Selected_status_final
+where BU_Mapped_New<>'Grocery'
+
+
+
+
+'''
+
+
+[[bqsql]]
+dag_id = 'per_storage'
+task_id = 'perfstorage_base'
+sql = '''
+create or replace table `noonbicompl.supply_planning.perf_storage` as
+with
+Cat_summary as (select BM1,country,cluster_name,id_partner,partner_name,category,product_fulltype_code,Storage_Type,0 as perf_storage
+from 
+ ( select 
+case when BM1 in ('Retail','Private_Label') then 'Retail'
+else BM1 end as BM1
+,a.country,
+ 	  b.cluster_name,
+	  a.id_partner,
+	  ref.display_name_en AS partner_name, 
+	 -- a.Sku,
+coalesce(b.comcat_code,b.commercial_reporting_category,b.reporting_category_parent,"Null") as category,
+b.product_fulltype_code,
+--a.product_type,
+--sum(gmv_aed) gmv,
+count (distinct a.item_nr) units_L0_30 
+ from `noonbigrowth.sales_noon.sales_complete_base`a
+   left join `noonbigrowth.assortment_noon.catalog` b on a.sku = b.sku
+    LEFT JOIN       `noondwh.ref.partner` ref ON a.id_partner=ref.id_partner 
+	---inner join Prim_cluster_telco t on a.id_partner=t.id_partner
+where date(order_pdate) between '2022-01-01' and current_date()  
+--and id_mp=1 
+and is_fbn=1
+group by 1,2,3,4,5,6,7 )a
+join 
+(select Storage_Type from noonbicompl.supply_planning.storage group by 1)  b
+on 1=1
+group by 1,2,3,4,5,6,7,8),
+
+Sales_Data as
+ (select BM1,country,cluster_name,id_partner,partner_name,Sku,category,product_fulltype_code,
+ title_en,
+product_type,
+product_subtype,
+ sum(units_L0_30) units_L0_30,
+sum(units_L0_30_DRR)units_L0_30_DRR
+from 
+  ( select 
+case when BM1 in ('Retail','Private_Label') then 'Retail'
+else BM1 end as BM1
+,a.country,
+ 	  b.cluster_name,
+	  a.id_partner,
+	  ref.display_name_en AS partner_name, 
+	  a.Sku,
+coalesce(b.comcat_code,b.commercial_reporting_category,b.reporting_category_parent,"Null") as category,
+b.product_fulltype_code,
+b.title_en,
+b.product_type,
+b.product_subtype,
+case when sl.partner_code is not null then 'Seller-flex' else 'Other' end as Slflex_Flag, 
+--sum(gmv_aed) gmv,
+count (distinct a.item_nr) units_L0_30 ,
+count (distinct a.item_nr)/count(distinct order_pdate) units_L0_30_DRR ,
+ from `noonbigrowth.sales_noon.sales_complete_base`a
+   left join `noonbigrowth.assortment_noon.catalog` b on a.sku = b.sku
+    LEFT JOIN       `noondwh.ref.partner` ref ON a.id_partner=ref.id_partner 
+	left join (select code as partner_code from `noondwh.wms.warehouse` where is_seller_flex = 1
+group by 1
+) sl  on sl.partner_code = a.warehouse_code
+	---inner join Prim_cluster_telco t on a.id_partner=t.id_partner
+where date(order_pdate) between DATE_TRUNC(DATE_ADD(current_Date(),interval -1 month),month) and DATE_TRUNC(current_Date(),month)-1
+--and id_mp=1 
+and is_fbn=1
+group by 1,2,3,4,5,6,7,8,9,10,11,12 ) a
+where Slflex_Flag='Other'
+group by 1,2,3,4,5,6,7,8,9,10,11)
+
+,dimensions as 
+	(select a.* from 
+	(
+	select 
+	DISTINCT(COALESCE(nsku, zsku, pbarcode_canonical)) as sku,
+	--pf.product_fulltype_code,
+	wb.weight weight, 
+	wb.longest_side length,
+	wb.median_side width,
+	wb.shortest_side height,
+	wb.volumetric_weight volumetric_weight,
+	wb.size_classification,
+	(volumetric_weight*5000/28317) cubic_feet
+	from noonbitechsc.vms.vms_pbarcode_cache wb 
+	--LEFT JOIN noonbicedata.psku_v1.content_sku pf on (COALESCE(wb.nsku, wb.zsku, wb.pbarcode_canonical)=content_sku)
+	--where weight is not null
+	--limit 100
+	)a
+	where sku is not null 
+	)
+
+----why 5000
+,
+sku_sales_dim as 
+(select 
+BM1,id_partner,partner_name,s.sku,country,
+cluster_name,category,product_fulltype_code,units_L0_30,
+title_en,
+product_type,
+product_subtype,
+length, width,height, volumetric_weight,weight,cubic_feet,
+length Long_side,
+width Median,
+height small_side,
+a.size_classification,
+greatest(volumetric_weight,weight) as Weight_final
+from Sales_Data s
+left join 
+dimensions a
+on s.sku=a.sku 
+---where category='mobiles'
+group by 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22)
+
+,
+
+-------------------------------------------------------------------
+sku_sales_dim_class as (
+select BM1,id_partner,category,product_fulltype_code,Storage_type ,units_L0_30,country,cubic_feet,
+sum(units_L0_30) over(partition by category,country,product_fulltype_code,id_partner,Storage_type,BM1)/
+sum(units_L0_30) over(partition by category,country,product_fulltype_code,id_partner,BM1) as size_class_percent,
+from 
+(select BM1,id_partner,category,Storage_type ,product_fulltype_code,country,sum(units_L0_30) units_L0_30,sum(units_L0_30*cubic_feet) cubic_feet
+from (select a.* 
+from 
+(select a.*,
+case when ( product_subtype in ('tv','televisions') and 
+(title_en like ('%43-Inch%') or  
+title_en like ('%43"%') or  
+title_en like ('%43 Inch%') or  
+title_en like ('%32 -Inch%') or  
+title_en like ('%32 inch%') or  
+title_en like ('%32-Inch%') or  
+title_en like ('%32 (Inch)%') or  
+title_en like ('%32 Inch%') or  
+title_en like ('%40" %') or 
+title_en like ('%40-Inch%') or 
+title_en like ('%40 Inch%') or 
+title_en like ('%40 Inch%') or 
+title_en like ('%48-Inch%') or 
+title_en like ('%49-Inch%') or 
+title_en like ('%50"%') or 
+title_en like ('%39 Inch%') or 
+title_en like ('%42-Inch%') or 
+title_en like ("%43'%") or 
+title_en like ("%43'%") or 
+title_en like ("%43 inch%") or 
+title_en like ("%43-inch%") or 
+title_en like ("%28-inch%") or 
+title_en like ("%28-inch%") or 
+title_en like ("%40Inch%") or 
+title_en like ('%50-Inch%') or 
+title_en like ('%50 Inch%') or 
+title_en like ('%50 inch%') or 
+title_en like ('%50-inch%') or 
+title_en like ('%50”%') or 
+title_en like ('%43â€%') or 
+title_en like ('%32â€%') or 
+title_en like ('%42- inch%') or 
+title_en like ('%55 Inch%') or 
+title_en like ('%55 inch%') or 
+title_en like ('%55-Inch%') or 
+title_en like ('%55"%') )) then '55_inch' else 'others' end as  Upto_55_Inch_TV,
+case when ( product_subtype in ('tv','televisions') and 
+(title_en like ('%43-Inch%') or  
+title_en like ('%43"%') or  
+title_en like ('%43 Inch%') or  
+title_en like ('%32 -Inch%') or  
+title_en like ('%32 inch%') or  
+title_en like ('%32-Inch%') or  
+title_en like ('%32 (Inch)%') or  
+title_en like ('%32 Inch%') or  
+title_en like ('%40" %') or 
+title_en like ('%40-Inch%') or 
+title_en like ('%40 Inch%') or 
+title_en like ('%40 Inch%') or 
+title_en like ('%48-Inch%') or 
+title_en like ('%49-Inch%') or 
+title_en like ('%50"%') or 
+title_en like ('%39 Inch%') or 
+title_en like ('%42-Inch%') or 
+title_en like ("%43'%") or 
+title_en like ("%43'%") or 
+title_en like ("%43 inch%") or 
+title_en like ("%43-inch%") or 
+title_en like ("%28-inch%") or 
+title_en like ("%28-inch%") or 
+title_en like ("%40Inch%") or 
+title_en like ('%50-Inch%') or 
+title_en like ('%50 Inch%') or 
+title_en like ('%50 inch%') or 
+title_en like ('%50-inch%') or 
+title_en like ('%50”%') or 
+title_en like ('%43â€%') or 
+title_en like ('%32â€%') or 
+title_en like ('%42- inch%') or 
+title_en like ('%55 Inch%') or 
+title_en like ('%55 inch%') or 
+title_en like ('%55-Inch%') or 
+title_en like ('%55"%') or 
+title_en like ('%58-Inch%') or 
+title_en like ('%58 Inch%') or 
+title_en like ('%58"%') or 
+title_en like ('%60 Inch%') or 
+title_en like ('%60 Inch%') or 
+title_en like ('%65  Inch%') or 
+title_en like ('%65 Inch%') or 
+title_en like ('%65 inch%') or 
+title_en like ('%65-Inch%') or 
+title_en like ('%65"%') )) then '65_inch' else 'others' end as  Upto_65_Inch_TV
+from 
+(select a.*,
+case 
+when product_fulltype_code in ('mobiles-mobile_phones-refurbished_smartphones',
+'mobiles-mobile_phones-smartphones',
+'mobiles-tablets-tablets',
+'laptops-laptops-notebook',
+'laptops-laptops-ultrabook',
+'laptops-laptops-netbooks',
+'laptops-laptops-convertible_2_in_1'
+) then 'HRV'
+when a.category in ('vg_consoles') then 'HRV'
+when a.category in ('apparel','footwear') then 'Apparel_Footwear'
+when (a.category in ('bags_luggage') and a.product_subtype in ('backpack',
+'fashion_backpack',
+'hiking_backpack',
+'kids_backpack',
+'backpack',
+'bucket_bag',
+'clutch',
+'crossbody_bag',
+'handbags_accessories',
+'hobo',
+'satchel',
+'shopper_tote',
+'shoulder_bag',
+'waistpack_belt_bag',
+'duffel_bag',
+'travel_tote',
+'waistpack_crossbody_bag',
+'baby_diaper_bag',
+'cosmetic_toiletry_bag',
+'gym_sacks',
+'lunch_bag',
+'pencil_case',
+'shopping_bag',
+'thermal_cooler_bag',
+'card_holder',
+'coin_purse',
+'document_holder',
+'money_clip',
+'passport_holder',
+'wallet',
+'laptop_bag',
+'sleeves',
+'cosmetic_case',
+'eyemasks_earplugs',
+'garment_bag',
+'key_chain',
+'key_ring',
+'laundry_bag',
+'luggage_belt',
+'luggage_cover',
+'luggage_lock',
+'luggage_scale',
+'luggage_tag',
+'packing_organizers',
+'shoe_bag',
+'travel_pillows',
+'umbrella',
+'wash_bag')) then 'Apparel_Footwear'
+when a.category in ('grocery')  then 'Temp_Control'
+when a.product_type in ('nutrition','vitamins_dietary_supplements','sports_nutrition')  then 'Temp_Control'
+----when (country in ('SA','EG') and product_type in ('diaper')) then 'Temp_Control'
+when size_classification in ('small_envelope','standard_parcel','large_envelope','standard_envelope') then 'Standard'
+when size_classification in  ('oversize','medium_oversize') then 'Oversize'
+when size_classification in ('bulky','extra_oversize') then 'Bulky'
+--when Long_side<=130 and Median<=130 and small_side<=130  and  Weight_final<=30 then 'Extra - Oversize'
+else 'NA' end as Storage_type
+from sku_sales_dim a ) a )a)
+--where Size_classification<>'NA'
+group by 1,2,3,4,5,6)
+group by 1,2,3,4,5,6,7,8)
+
+--select * from sku_sales_dim_class where id_partner=36034
+
+,seller_nosales as (select * from (
+select a.*,b.units_L0_30 from 
+(select BM1,id_partner from Cat_summary group by 1,2) a 
+left join 
+(
+select id_partner, 
+sum(cubic_feet) cubic_feet,sum(units_L0_30) units_L0_30
+from 
+sku_sales_dim_class
+where Storage_type <>'NA'
+group by 1)b
+on a.id_partner=b.id_partner
+where units_L0_30 is null
+and BM1='FBN'
+)
+union all 
+(
+select a.*,b.units_L0_30 from 
+(select BM1,id_partner from Cat_summary group by 1,2) a 
+left join 
+(
+select id_partner, 
+sum(cubic_feet) cubic_feet,sum(units_L0_30) units_L0_30
+from 
+sku_sales_dim_class
+where Storage_type <>'NA'
+group by 1)b
+on a.id_partner=b.id_partner
+where units_L0_30 <5
+and BM1='FBN'
+)),
+
+--------------- CHeck Query ---
+base_1 as
+(select a.BM1,a.country,a.id_partner,a.partner_name,a.category,a.Storage_Type,Units_all,units_size,cubic_feet,Multiplication_Factor,c.DOH_Target,
+(Perf_Storage_units/30)*(case when Storage_Type in ('Standard','Apparel_Footwear','HRV') then coalesce(c.DOH_Target,30) else 30 end) Perf_Storage_Units,
+(Perf_Storage_Space_Cub_Feet/30)*(case when Storage_Type in ('Standard','Apparel_Footwear','HRV') then coalesce(c.DOH_Target,30) else 30 end) Perf_Storage_Space_Cub_Feet
+from 
+(select a.BM1,a.country,a.id_partner,a.partner_name,a.category,a.Storage_Type,Multiplication_Factor,sum(units_L0_30) Units_all,sum(units_L0_30) units_size,sum(Perf_Storage_units) Perf_Storage_units,sum(cubic_feet) cubic_feet,
+sum(COALESCE(b.Perf_Storage_Space_Cub_Feet,a.perf_storage)) Perf_Storage_Space_Cub_Feet
+from 
+Cat_summary a
+left join 
+(select a.* , Multiplication_Factor,(cubic_feet)*(coalesce(Multiplication_Factor,1)) Perf_Storage_Space_Cub_Feet,
+(units_L0_30)*(coalesce(Multiplication_Factor,1)) Perf_Storage_units
+from 
+(select * from sku_sales_dim_class where Storage_type <>'NA') a
+left join (select country,Category category,max(Multiplication_Factor) Multiplication_Factor
+from noonbicompl.supply_planning.perf_multi_factor
+where country is not null group by 1,2)
+ m on a.country=m.country and a.category=m.category) b
+on 
+a.BM1=b.BM1 and a.country=b.country and a.id_partner=b.id_partner and a.category=b.category
+and a.Storage_Type=b.Storage_Type and a.product_fulltype_code=b.product_fulltype_code
+group by 1,2,3,4,5,6,7
+)a
+left join
+(select case when BU like'%FBN%' then 'FBN' else 'Retail' end as BM1,Category,max(DOH_Target_) DOH_Target  from 
+noonbicompl.supply_planning.target_str group by 1,2) c
+on a.BM1=c.BM1 and a.Category=c.Category
+)
+ ,
+perf_base_1 as
+(select a.BM1,a.country,a.id_partner,a.partner_name,a.category,a.Storage_Type,
+sum(a.Perf_Storage_Space_Cub_Feet*Multi_factor_perf) as Perf_Storage_Space_Cub_Feet 
+from base_1 a 
+left join 
+noonbicompl.supply_planning.wh_multi_factor_perfmax b
+on a.country=b.country and a.Storage_Type=b.Storage_Type
+where a.id_partner not in (select id_partner from seller_nosales where id_partner is not null group by 1)
+---and id_partner=20412 
+group by 1,2,3,4,5,6)
+,perf_st as                
+(              
+select a.BM1,a.country,id_partner,partner_name,'cat' as category, a.Storage_Type,greatest(Perf_Storage_Space_Cub_Feet,b.Base_Cubic_FT) Perf_Storage_Space_Cub_Feet,
+from 
+(select a.BM1,a.country,a.id_partner,a.partner_name,a.Storage_Type,
+sum(a.Perf_Storage_Space_Cub_Feet*Multi_factor_perf) as Perf_Storage_Space_Cub_Feet 
+from base_1 a 
+left join 
+noonbicompl.supply_planning.wh_multi_factor_perfmax b
+on a.country=b.country and a.Storage_Type=b.Storage_Type
+where a.id_partner not in (select id_partner from seller_nosales where id_partner is not null group by 1)
+---and id_partner=20412 
+group by 1,2,3,4,5)a
+left join 
+noonbicompl.supply_planning.new_Seller_base_storage b
+on a.country=b.country and a.Storage_Type=b.Storage_Type)
+
+select * except (Perf_Storage_Space_Cub_Feet),
+case when id_partner=38098 and country='SA' and Storage_Type='Oversize' then 16000 
+when id_partner=13912 and country='SA' and Storage_Type='Oversize' then 8000 
+when id_partner=14050 and country='SA' and Storage_Type='Bulky' then (Perf_Storage_Space_Cub_Feet+2000) 
+when id_partner=19593 and country='SA' and Storage_Type='Bulky' then (Perf_Storage_Space_Cub_Feet+2000 )
+when id_partner=11296 and country='SA' and Storage_Type='Bulky' then (Perf_Storage_Space_Cub_Feet+1000 )
+when id_partner=38098 and country='SA' and Storage_Type='Bulky' then (Perf_Storage_Space_Cub_Feet+1000 )
+when id_partner=12711 and country='SA' and Storage_Type in ('Oversize','Standard') then (Perf_Storage_Space_Cub_Feet*1.4 )
+when id_partner=34787 and country='AE' and Storage_Type='Bulky' then 300 
+	when id_partner=11704 and country='AE' and Storage_Type='Bulky' then 1500 
+when id_partner=16457 and country='SA' and Storage_Type='Oversize' then 2200 
+else Perf_Storage_Space_Cub_Feet end as Perf_Storage_Space_Cub_Feet
+from perf_st
+
+
+
+'''
+
+[[bqsql]]
+dag_id = 'per_storage'
+task_id = 'perfstorage_base_calc'
+sql = '''
+create or replace table `noonbicompl.supply_planning.perf_storage_calc` as
+with
+Cat_summary as (select BM1,country,cluster_name,id_partner,partner_name,category,product_fulltype_code,Storage_Type,0 as perf_storage
+from 
+ ( select 
+case when BM1 in ('Retail','Private_Label') then 'Retail'
+else BM1 end as BM1
+,a.country,
+ 	  b.cluster_name,
+	  a.id_partner,
+	  ref.display_name_en AS partner_name, 
+	 -- a.Sku,
+coalesce(b.comcat_code,b.commercial_reporting_category,b.reporting_category_parent,"Null") as category,
+b.product_fulltype_code,
+--a.product_type,
+--sum(gmv_aed) gmv,
+count (distinct a.item_nr) units_L0_30 
+ from `noonbigrowth.sales_noon.sales_complete_base`a
+   left join `noonbigrowth.assortment_noon.catalog` b on a.sku = b.sku
+    LEFT JOIN       `noondwh.ref.partner` ref ON a.id_partner=ref.id_partner 
+	---inner join Prim_cluster_telco t on a.id_partner=t.id_partner
+where date(order_pdate) between '2022-01-01' and current_date()  
+--and id_mp=1 
+and is_fbn=1
+group by 1,2,3,4,5,6,7 )a
+join 
+(select Storage_Type from noonbicompl.supply_planning.storage group by 1)  b
+on 1=1
+group by 1,2,3,4,5,6,7,8),
+
+Sales_Data as
+ (select BM1,country,cluster_name,id_partner,partner_name,Sku,category,product_fulltype_code,
+ title_en,
+product_type,
+product_subtype,
+ sum(units_L0_30) units_L0_30,
+sum(units_L0_30_DRR)units_L0_30_DRR
+from 
+  ( select 
+case when BM1 in ('Retail','Private_Label') then 'Retail'
+else BM1 end as BM1
+,a.country,
+ 	  b.cluster_name,
+	  a.id_partner,
+	  ref.display_name_en AS partner_name, 
+	  a.Sku,
+coalesce(b.comcat_code,b.commercial_reporting_category,b.reporting_category_parent,"Null") as category,
+b.product_fulltype_code,
+b.title_en,
+b.product_type,
+b.product_subtype,
+case when sl.partner_code is not null then 'Seller-flex' else 'Other' end as Slflex_Flag, 
+--sum(gmv_aed) gmv,
+count (distinct a.item_nr) units_L0_30 ,
+count (distinct a.item_nr)/count(distinct order_pdate) units_L0_30_DRR ,
+ from `noonbigrowth.sales_noon.sales_complete_base`a
+   left join `noonbigrowth.assortment_noon.catalog` b on a.sku = b.sku
+    LEFT JOIN       `noondwh.ref.partner` ref ON a.id_partner=ref.id_partner 
+	left join (select code as partner_code from `noondwh.wms.warehouse` where is_seller_flex = 1
+group by 1
+) sl  on sl.partner_code = a.warehouse_code
+	---inner join Prim_cluster_telco t on a.id_partner=t.id_partner
+where date(order_pdate) between DATE_TRUNC(DATE_ADD(current_Date(),interval -1 month),month) and DATE_TRUNC(current_Date(),month)-1
+--and id_mp=1 
+and is_fbn=1
+group by 1,2,3,4,5,6,7,8,9,10,11,12 ) a
+where Slflex_Flag='Other'
+group by 1,2,3,4,5,6,7,8,9,10,11)
+
+,dimensions as 
+	(select a.* from 
+	(
+	select 
+	DISTINCT(COALESCE(nsku, zsku, pbarcode_canonical)) as sku,
+	--pf.product_fulltype_code,
+	wb.weight weight, 
+	wb.longest_side length,
+	wb.median_side width,
+	wb.shortest_side height,
+	wb.volumetric_weight volumetric_weight,
+	wb.size_classification,
+	(volumetric_weight*5000/28317) cubic_feet
+	from noonbitechsc.vms.vms_pbarcode_cache wb 
+	--LEFT JOIN noonbicedata.psku_v1.content_sku pf on (COALESCE(wb.nsku, wb.zsku, wb.pbarcode_canonical)=content_sku)
+	--where weight is not null
+	--limit 100
+	)a
+	where sku is not null 
+	)
+
+----why 5000
+,
+sku_sales_dim as 
+(select 
+BM1,id_partner,partner_name,s.sku,country,
+cluster_name,category,product_fulltype_code,units_L0_30,
+title_en,
+product_type,
+product_subtype,
+length, width,height, volumetric_weight,weight,cubic_feet,
+length Long_side,
+width Median,
+height small_side,
+a.size_classification,
+greatest(volumetric_weight,weight) as Weight_final
+from Sales_Data s
+left join 
+dimensions a
+on s.sku=a.sku 
+---where category='mobiles'
+group by 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22)
+
+,
+
+-------------------------------------------------------------------
+sku_sales_dim_class as (
+select BM1,id_partner,category,product_fulltype_code,Storage_type ,units_L0_30,country,cubic_feet,
+sum(units_L0_30) over(partition by category,country,product_fulltype_code,id_partner,Storage_type,BM1)/
+sum(units_L0_30) over(partition by category,country,product_fulltype_code,id_partner,BM1) as size_class_percent,
+from 
+(select BM1,id_partner,category,Storage_type ,product_fulltype_code,country,sum(units_L0_30) units_L0_30,sum(units_L0_30*cubic_feet) cubic_feet
+from (select a.* 
+from 
+(select a.*,
+case when ( product_subtype in ('tv','televisions') and 
+(title_en like ('%43-Inch%') or  
+title_en like ('%43"%') or  
+title_en like ('%43 Inch%') or  
+title_en like ('%32 -Inch%') or  
+title_en like ('%32 inch%') or  
+title_en like ('%32-Inch%') or  
+title_en like ('%32 (Inch)%') or  
+title_en like ('%32 Inch%') or  
+title_en like ('%40" %') or 
+title_en like ('%40-Inch%') or 
+title_en like ('%40 Inch%') or 
+title_en like ('%40 Inch%') or 
+title_en like ('%48-Inch%') or 
+title_en like ('%49-Inch%') or 
+title_en like ('%50"%') or 
+title_en like ('%39 Inch%') or 
+title_en like ('%42-Inch%') or 
+title_en like ("%43'%") or 
+title_en like ("%43'%") or 
+title_en like ("%43 inch%") or 
+title_en like ("%43-inch%") or 
+title_en like ("%28-inch%") or 
+title_en like ("%28-inch%") or 
+title_en like ("%40Inch%") or 
+title_en like ('%50-Inch%') or 
+title_en like ('%50 Inch%') or 
+title_en like ('%50 inch%') or 
+title_en like ('%50-inch%') or 
+title_en like ('%50”%') or 
+title_en like ('%43â€%') or 
+title_en like ('%32â€%') or 
+title_en like ('%42- inch%') or 
+title_en like ('%55 Inch%') or 
+title_en like ('%55 inch%') or 
+title_en like ('%55-Inch%') or 
+title_en like ('%55"%') )) then '55_inch' else 'others' end as  Upto_55_Inch_TV,
+case when ( product_subtype in ('tv','televisions') and 
+(title_en like ('%43-Inch%') or  
+title_en like ('%43"%') or  
+title_en like ('%43 Inch%') or  
+title_en like ('%32 -Inch%') or  
+title_en like ('%32 inch%') or  
+title_en like ('%32-Inch%') or  
+title_en like ('%32 (Inch)%') or  
+title_en like ('%32 Inch%') or  
+title_en like ('%40" %') or 
+title_en like ('%40-Inch%') or 
+title_en like ('%40 Inch%') or 
+title_en like ('%40 Inch%') or 
+title_en like ('%48-Inch%') or 
+title_en like ('%49-Inch%') or 
+title_en like ('%50"%') or 
+title_en like ('%39 Inch%') or 
+title_en like ('%42-Inch%') or 
+title_en like ("%43'%") or 
+title_en like ("%43'%") or 
+title_en like ("%43 inch%") or 
+title_en like ("%43-inch%") or 
+title_en like ("%28-inch%") or 
+title_en like ("%28-inch%") or 
+title_en like ("%40Inch%") or 
+title_en like ('%50-Inch%') or 
+title_en like ('%50 Inch%') or 
+title_en like ('%50 inch%') or 
+title_en like ('%50-inch%') or 
+title_en like ('%50”%') or 
+title_en like ('%43â€%') or 
+title_en like ('%32â€%') or 
+title_en like ('%42- inch%') or 
+title_en like ('%55 Inch%') or 
+title_en like ('%55 inch%') or 
+title_en like ('%55-Inch%') or 
+title_en like ('%55"%') or 
+title_en like ('%58-Inch%') or 
+title_en like ('%58 Inch%') or 
+title_en like ('%58"%') or 
+title_en like ('%60 Inch%') or 
+title_en like ('%60 Inch%') or 
+title_en like ('%65  Inch%') or 
+title_en like ('%65 Inch%') or 
+title_en like ('%65 inch%') or 
+title_en like ('%65-Inch%') or 
+title_en like ('%65"%') )) then '65_inch' else 'others' end as  Upto_65_Inch_TV
+from 
+(select a.*,
+case 
+when product_fulltype_code in ('mobiles-mobile_phones-refurbished_smartphones',
+'mobiles-mobile_phones-smartphones',
+'mobiles-tablets-tablets',
+'laptops-laptops-notebook',
+'laptops-laptops-ultrabook',
+'laptops-laptops-netbooks',
+'laptops-laptops-convertible_2_in_1'
+) then 'HRV'
+when a.category in ('vg_consoles') then 'HRV'
+when a.category in ('apparel','footwear') then 'Apparel_Footwear'
+when (a.category in ('bags_luggage') and a.product_subtype in ('backpack',
+'fashion_backpack',
+'hiking_backpack',
+'kids_backpack',
+'backpack',
+'bucket_bag',
+'clutch',
+'crossbody_bag',
+'handbags_accessories',
+'hobo',
+'satchel',
+'shopper_tote',
+'shoulder_bag',
+'waistpack_belt_bag',
+'duffel_bag',
+'travel_tote',
+'waistpack_crossbody_bag',
+'baby_diaper_bag',
+'cosmetic_toiletry_bag',
+'gym_sacks',
+'lunch_bag',
+'pencil_case',
+'shopping_bag',
+'thermal_cooler_bag',
+'card_holder',
+'coin_purse',
+'document_holder',
+'money_clip',
+'passport_holder',
+'wallet',
+'laptop_bag',
+'sleeves',
+'cosmetic_case',
+'eyemasks_earplugs',
+'garment_bag',
+'key_chain',
+'key_ring',
+'laundry_bag',
+'luggage_belt',
+'luggage_cover',
+'luggage_lock',
+'luggage_scale',
+'luggage_tag',
+'packing_organizers',
+'shoe_bag',
+'travel_pillows',
+'umbrella',
+'wash_bag')) then 'Apparel_Footwear'
+when a.category in ('grocery')  then 'Temp_Control'
+when a.product_type in ('nutrition','vitamins_dietary_supplements','sports_nutrition','cough_and_cold')  then 'Temp_Control'
+when a.product_subtype in ('antiseptics_antibiotics','allergy_medicine','antacid','asthma_allergy','asthma_medicine','cough_cold','diabetes','ear_drops','eye_care',
+'family_planning_supplements_enhancements',
+'gas_relief',
+'healing_ointment',
+'laxative',
+'motion_sickness_and_nausea',
+'pain_relief_medicine',
+'pain_relief_solution',
+'smoking_cessation',
+'stress_reduction',
+'urinary_tract_infection_medicine'
+)  then 'Temp_Control'
+when size_classification in ('small_envelope','standard_parcel','large_envelope','standard_envelope') then 'Standard'
+when size_classification in  ('oversize','medium_oversize') then 'Oversize'
+when size_classification in ('bulky','extra_oversize') then 'Bulky'
+--when Long_side<=130 and Median<=130 and small_side<=130  and  Weight_final<=30 then 'Extra - Oversize'
+else 'NA' end as Storage_type
+from sku_sales_dim a ) a )a)
+--where Size_classification<>'NA'
+group by 1,2,3,4,5,6)
+group by 1,2,3,4,5,6,7,8)
+
+--select * from sku_sales_dim_class where id_partner=36034
+
+,seller_nosales as (select * from (
+select a.*,b.units_L0_30 from 
+(select BM1,id_partner from Cat_summary group by 1,2) a 
+left join 
+(
+select id_partner, 
+sum(cubic_feet) cubic_feet,sum(units_L0_30) units_L0_30
+from 
+sku_sales_dim_class
+where Storage_type <>'NA'
+group by 1)b
+on a.id_partner=b.id_partner
+where units_L0_30 is null
+and BM1='FBN'
+)
+union all 
+(
+select a.*,b.units_L0_30 from 
+(select BM1,id_partner from Cat_summary group by 1,2) a 
+left join 
+(
+select id_partner, 
+sum(cubic_feet) cubic_feet,sum(units_L0_30) units_L0_30
+from 
+sku_sales_dim_class
+where Storage_type <>'NA'
+group by 1)b
+on a.id_partner=b.id_partner
+where units_L0_30 <5
+and BM1='FBN'
+)),
+
+--------------- CHeck Query ---
+base_1 as
+(select a.BM1,a.country,a.id_partner,a.partner_name,a.category,a.Storage_Type,Units_all,units_size,cubic_feet,Multiplication_Factor,c.DOH_Target,
+(Perf_Storage_units/30)*(case when Storage_Type in ('Standard','Apparel_Footwear','HRV') then coalesce(c.DOH_Target,30) else 30 end) Perf_Storage_Units,
+(Perf_Storage_Space_Cub_Feet/30)*(case when Storage_Type in ('Standard','Apparel_Footwear','HRV') then coalesce(c.DOH_Target,30) else 30 end) Perf_Storage_Space_Cub_Feet
+from 
+(select a.BM1,a.country,a.id_partner,a.partner_name,a.category,a.Storage_Type,Multiplication_Factor,sum(units_L0_30) Units_all,sum(units_L0_30) units_size,sum(Perf_Storage_units) Perf_Storage_units,sum(cubic_feet) cubic_feet,
+sum(COALESCE(b.Perf_Storage_Space_Cub_Feet,a.perf_storage)) Perf_Storage_Space_Cub_Feet
+from 
+Cat_summary a
+left join 
+(select a.* , Multiplication_Factor,(cubic_feet)*(coalesce(Multiplication_Factor,1)) Perf_Storage_Space_Cub_Feet,
+(units_L0_30)*(coalesce(Multiplication_Factor,1)) Perf_Storage_units
+from 
+(select * from sku_sales_dim_class where Storage_type <>'NA') a
+left join (select country,Category category,max(Multiplication_Factor) Multiplication_Factor
+from noonbicompl.supply_planning.perf_multi_factor
+where country is not null group by 1,2)
+ m on a.country=m.country and a.category=m.category) b
+on 
+a.BM1=b.BM1 and a.country=b.country and a.id_partner=b.id_partner and a.category=b.category
+and a.Storage_Type=b.Storage_Type and a.product_fulltype_code=b.product_fulltype_code
+group by 1,2,3,4,5,6,7
+)a
+left join
+(select case when BU like'%FBN%' then 'FBN' else 'Retail' end as BM1,Category,max(DOH_Target_) DOH_Target  from 
+noonbicompl.supply_planning.target_str group by 1,2) c
+on a.BM1=c.BM1 and a.Category=c.Category
+)
+(select a.BM1,a.country,a.id_partner,a.partner_name,a.category,a.Storage_Type,
+sum(a.Perf_Storage_Space_Cub_Feet*Multi_factor_perf) as Perf_Storage_Space_Cub_Feet 
+from base_1 a 
+left join 
+noonbicompl.supply_planning.wh_multi_factor_perfmax b
+on a.country=b.country and a.Storage_Type=b.Storage_Type
+where a.id_partner not in (select id_partner from seller_nosales where id_partner is not null group by 1)
+---and id_partner=20412 
+group by 1,2,3,4,5,6)
+
+
+
+'''
+
+
+
+
+[[bqsql]]
+dag_id = 'per_storage'
+task_id = 'Discretionary_storage'
+sql = '''
+create or replace table `noonbicompl.supply_planning.disc_storage` as
+select a.* except(Disc_storage_cubicft),
+GREATEST(d.Disc_min,COALESCE(CEIL(cast(Disc_storage_cubicft as INT64)),0)) as Disc_storage_cubicft
+from
+(select country,BM,Storage_Type,Cluster,
+case when (country='AE' and BM='FBN' and Storage_Type='Temp_Control' and Cluster='Beauty') then (1.7*Disc_storage_cubicft+1000)
+when (country='AE' and BM='FBN' and Storage_Type='Temp_Control' and Cluster='Emerging_Categories') then 1.9*Disc_storage_cubicft+200
+when (country='SA' and BM='FBN' and Storage_Type='Bulky' and Cluster='Baby_Toys') then 1.2*Disc_storage_cubicft+2000
+when (country='AE' and BM='FBN' and Storage_Type='Bulky' and Cluster='Baby_Toys') then Disc_storage_cubicft+1100
+when (country='AE' and BM='FBN' and Storage_Type='Oversize' and Cluster='Baby_Toys') then Disc_storage_cubicft*2
+when (country='SA' and BM='FBN' and Storage_Type='HRV' and Cluster='Emerging_Categories' and Disc_storage_cubicft<1) then 50
+when (country='AE' and BM='FBN' and Storage_Type='Bulky' and Cluster='Beauty') then (Disc_storage_cubicft+1200)
+when (country='SA' and BM='FBN' and Storage_Type='Temp_Control' and Cluster='Beauty' ) then (Disc_storage_cubicft+500)
+when (country='EG' and BM='FBN' and Storage_Type='Temp_Control' and Cluster='Beauty' and Disc_storage_cubicft<100) then 400
+when (country='EG' and BM='FBN' and Storage_Type='Oversize' and Cluster='Fashion' and Disc_storage_cubicft<100) then 510
+when (country='EG' and BM='FBN' and Storage_Type='Bulky' and Cluster='Home' and Disc_storage_cubicft<200) then 350
+when (country='AE' and BM='FBN' and Storage_Type='Bulky' and Cluster='Fashion' and Disc_storage_cubicft <2000 ) then 3000
+when (country='EG' and BM='FBN' and Storage_Type='Oversize' and Cluster='Home' and Disc_storage_cubicft <2000) then 4000
+when (country='EG' and BM='FBN' and Storage_Type='Oversize' and Cluster='Consumer_electronics') then (Disc_storage_cubicft*2)
+when (country='SA' and BM='FBN' and Storage_Type='Bulky' and Cluster='Consumer_electronics') then (Disc_storage_cubicft+22000)
+when (country='SA' and BM='FBN' and Storage_Type='Oversize' and Cluster='Consumer_electronics') then (Disc_storage_cubicft*1.5+20000)
+when (country='SA' and BM='FBN' and Storage_Type='Standard' and Cluster='Consumer_electronics') then (Disc_storage_cubicft+20000)
+when (country='AE' and BM='FBN' and Storage_Type='Standard' and Cluster='Consumer_electronics') then Disc_storage_cubicft*2
+when (country='SA' and BM='FBN' and Storage_Type='Oversize' and Cluster='Baby_Toys') then (Disc_storage_cubicft*1.2+20000)
+when (country='EG' and BM='FBN' and Storage_Type='Standard' and Cluster='Beauty') then (Disc_storage_cubicft + 4500)
+when (country='AE' and BM='FBN' and Storage_Type='HRV' and Cluster='Telco' and Disc_storage_cubicft<1000) then 2000
+when (country='AE' and BM='FBN' and Storage_Type='Standard' and Cluster='Telco' and Disc_storage_cubicft<1500) then 2000
+when (country='SA' and BM='FBN' and Storage_Type='Standard' and Cluster='Telco' and Disc_storage_cubicft<1500) then 2500
+when (country='SA' and BM='FBN' and Storage_Type='HRV' and Cluster='Telco' and Disc_storage_cubicft<1000) then 1500
+when (country='SA' and BM='FBN' and Storage_Type='Oversize' and Cluster='Emerging_Categories') then (Disc_storage_cubicft+4200)
+when (country='SA' and BM='FBN' and Storage_Type='HRV' and Cluster='Laptops_VG') then (Disc_storage_cubicft*1.2+9300)
+when (country='AE' and BM='FBN' and Storage_Type='HRV' and Cluster='Laptops_VG') then (Disc_storage_cubicft+6200)
+when (country='AE' and BM='FBN' and Storage_Type='Bulky' and Cluster='Laptops_VG') then Disc_storage_cubicft*1.5
+when (country='SA' and BM='FBN' and Storage_Type='Oversize' and Cluster='Laptops_VG') then Disc_storage_cubicft*1.2
+when (country='EG' and BM='FBN' and Storage_Type='Standard' and Cluster='Baby_Toys') then (Disc_storage_cubicft+800)
+when (country='SA' and BM='FBN' and Storage_Type='Oversize' and Cluster='Home') then (Disc_storage_cubicft+38000)
+when (country='AE' and BM='FBN' and Storage_Type='Apparel_Footwear' and Cluster='Fashion') then (Disc_storage_cubicft+10000)
+when (country='AE' and BM='FBN' and Storage_Type='Standard' and Cluster='Fashion') then (Disc_storage_cubicft+2000)
+else Disc_storage_cubicft end as Disc_storage_cubicft,
+Perf_Storage_Space_Cub_Feet
+from 
+(select a.country , 
+case when BM1 in ('Retail','Private_Label') then 'Retail'
+else BM1 end as BM,a.Storage_Type,
+ Cluster,sum (Perf_Storage_Space_Cub_Feet*b.Multi_factor_disc) as Disc_storage_cubicft ,
+ sum (Perf_Storage_Space_Cub_Feet) Perf_Storage_Space_Cub_Feet
+from 
+(select a.*,b.Cluster from `noonbicompl.supply_planning.perf_storage_calc` a
+left join 
+(select Category,Cluster from  noonbicompl.ref_tables.Cluster_Categ_Mapping group by 1,2) b
+on  a.category=b.category)a
+left join 
+noonbicompl.supply_planning.wh_multi_factor_perfmax b
+on a.country=b.country and a.Storage_Type=b.Storage_Type
+where cluster is not null
+group by 1,2,3,4
+union all 
+select country,BM,Storage_Type,'Replenishment_cluster' as Cluster,
+sum(Repli_Total) Disc_storage_cubicft,sum(Perf_Storage_Space_Cub_Feet)Perf_Storage_Space_Cub_Feet
+from 
+(select country,BM,Storage_Type,Cluster,
+case when Storage_Type not in ('Temp_Control','Bulky') then 0.1*Disc_storage_cubicft
+else 0 end as Repli_Total,
+Perf_Storage_Space_Cub_Feet
+from 
+(select country,BM,Storage_Type,Cluster,
+case when (country='AE' and BM='FBN' and Storage_Type='Temp_Control' and Cluster='Beauty') then 1.7*Disc_storage_cubicft
+when (country='AE' and BM='FBN' and Storage_Type='Temp_Control' and Cluster='Emerging_Categories') then 1.9*Disc_storage_cubicft
+when (country='EG' and BM='FBN' and Storage_Type='Temp_Control' and Cluster='Beauty') then 3*Disc_storage_cubicft
+when (country='SA' and BM='FBN' and Storage_Type='Bulky' and Cluster='Baby_Toys') then 1.2*Disc_storage_cubicft
+when (country='SA' and BM='FBN' and Storage_Type='HRV' and Cluster='Emerging_Categories' and Disc_storage_cubicft<1) then 50
+when (country='AE' and BM='FBN' and Storage_Type='Bulky' and Cluster='Beauty' and Disc_storage_cubicft<20) then 50
+else Disc_storage_cubicft end as Disc_storage_cubicft,
+Perf_Storage_Space_Cub_Feet
+from 
+(select a.country , 
+case when BM1 in ('Retail','Private_Label') then 'Retail'
+else BM1 end as BM,a.Storage_Type,
+ Cluster,sum (Perf_Storage_Space_Cub_Feet*b.Multi_factor_disc) as Disc_storage_cubicft ,
+ sum (Perf_Storage_Space_Cub_Feet) Perf_Storage_Space_Cub_Feet
+from 
+(select a.*,b.Cluster from `noonbicompl.supply_planning.perf_storage` a
+left join 
+(select Category,Cluster from  noonbicompl.ref_tables.Cluster_Categ_Mapping group by 1,2) b
+on  a.category=b.category)a
+left join 
+noonbicompl.supply_planning.wh_multi_factor_perfmax b
+on a.country=b.country and a.Storage_Type=b.Storage_Type
+where cluster is not null
+group by 1,2,3,4)))
+where BM is not null
+group by 1,2,3,4)
+where BM is not null)a
+left join 
+noonbicompl.supply_planning.disc_base d
+on a.storage_type =d.storage_type
+
+'''
+
+
+[[bqsql]]
+dag_id = 'per_storage'
+task_id = 'exception_storage_mapping'
+sql = '''
+create or replace table `noonbicompl.supply_planning.exception_storage_mapping` as
+select * from 
+(select a.*,case 
+when product_fulltype_code in ('mobiles-mobile_phones-refurbished_smartphones',
+'mobiles-mobile_phones-smartphones',
+'mobiles-tablets-tablets',
+'laptops-laptops-notebook',
+'laptops-laptops-ultrabook',
+'laptops-laptops-netbooks',
+'laptops-laptops-convertible_2_in_1'
+) then 'HRV'
+when a.category in ('vg_consoles') then 'HRV'
+when a.category in ('apparel','footwear') then 'Apparel_Footwear'
+when   (a.category in ('bags_luggage') and a.product_subtype in ('backpack',
+'fashion_backpack',
+'hiking_backpack',
+'kids_backpack',
+'backpack',
+'bucket_bag',
+'clutch',
+'crossbody_bag',
+'handbags_accessories',
+'hobo',
+'satchel',
+'shopper_tote',
+'shoulder_bag',
+'waistpack_belt_bag',
+'duffel_bag',
+'travel_tote',
+'waistpack_crossbody_bag',
+'baby_diaper_bag',
+'cosmetic_toiletry_bag',
+'gym_sacks',
+'lunch_bag',
+'pencil_case',
+'shopping_bag',
+'thermal_cooler_bag',
+'card_holder',
+'coin_purse',
+'document_holder',
+'money_clip',
+'passport_holder',
+'wallet',
+'laptop_bag',
+'sleeves',
+'cosmetic_case',
+'eyemasks_earplugs',
+'garment_bag',
+'key_chain',
+'key_ring',
+'laundry_bag',
+'luggage_belt',
+'luggage_cover',
+'luggage_lock',
+'luggage_scale',
+'luggage_tag',
+'packing_organizers',
+'shoe_bag',
+'travel_pillows',
+'umbrella',
+'wash_bag')) then 'Apparel_Footwear'
+when a.category in ('grocery')  then 'Temp_Control'
+when a.product_type in ('nutrition','vitamins_dietary_supplements','sports_nutrition','cough_and_cold')  then 'Temp_Control'
+when a.product_subtype in ('antiseptics_antibiotics','allergy_medicine','antacid','asthma_allergy','asthma_medicine','cough_cold','diabetes','ear_drops','eye_care',
+'family_planning_supplements_enhancements',
+'gas_relief',
+'healing_ointment',
+'laxative',
+'motion_sickness_and_nausea',
+'pain_relief_medicine',
+'pain_relief_solution',
+'smoking_cessation',
+'stress_reduction',
+'urinary_tract_infection_medicine'
+)  then 'Temp_Control'
+else 'NA' end as Storage_Type from 
+(select 
+coalesce(a.comcat_code,a.commercial_reporting_category,a.reporting_category_parent,"Null") as category,
+a.product_type,
+a.product_subtype,
+a.product_fulltype_code
+from 
+`noonbigrowth.assortment_noon.catalog` a 
+group by 1,2,3,4)a
+group by 1,2,3,4,5 )
+where Storage_Type  not in ('NA')
+and product_subtype is not null
+and product_fulltype_code <>'home_improvement-laundry_care-clothes_drying_stand'
+
+'''
+
+
+[[bqsql]]
+dag_id = 'per_storage'
+task_id = 'list4_Sku_exception'
+sql = '''
+create or replace table `noonbicompl.supply_planning.special_sku_list_exception` as
+with base as 
+(select country,
+inventory_date,
+sku, 
+id_partner, 
+warehouse_code, 
+partner_code, 
+sum(stock) as stock,
+sum(live_stock) as live_stock
+from 
+(
+select a.warehouse_country as country, 
+date as inventory_date,
+a.sku, 
+a.id_partner, 
+a.warehouse_code, 
+sum(a.stock_net) as stock,
+sum(case when a.is_live=1 then a.stock_net else 0 end) as live_stock
+FROM `noonbigrowth.assortment_noon.psku_sku_mapped_sa` a
+where
+a.warehouse_country = 'SA'
+and date between current_date and current_date
+and a.is_fbn=1
+and a.stock_net>0
+group by 1,2,3,4,5
+union all 
+select a.warehouse_country as country, 
+date as inventory_date,
+a.sku, 
+a.id_partner, 
+a.warehouse_code, 
+sum(a.stock_net) as stock,
+sum(case when a.is_live=1 then a.stock_net else 0 end) as live_stock
+FROM `noonbigrowth.assortment_noon.psku_sku_mapped_ae` a
+where
+a.warehouse_country = 'AE'
+and date between current_date and current_date
+and a.is_fbn=1
+and a.stock_net>0
+group by 1,2,3,4,5
+union all 
+select a.warehouse_country as country, 
+date as inventory_date,
+a.sku, 
+a.id_partner, 
+a.warehouse_code, 
+sum(a.stock_net) as stock,
+sum(case when a.is_live=1 then a.stock_net else 0 end) as live_stock
+FROM `noonbigrowth.assortment_noon.psku_sku_mapped_eg` a
+where
+a.warehouse_country = 'EG'
+and date between current_date and current_date
+and a.is_fbn=1
+and a.stock_net>0
+group by 1,2,3,4,5
+) x 
+left join 
+`noondwh.partner.partner_warehouse` f 
+on x.warehouse_code = f.code
+group by 1,2,3,4,5,6),
+SKU_catalog as 
+(select *
+from 
+(select * from (
+select b.*,
+coalesce(comcat_code,commercial_reporting_category,reporting_category_parent,"Null") as category,
+title_en,
+product_type,
+product_subtype,
+family,
+cluster_name
+from base  b 
+left join 
+`noonbigrowth.assortment_noon.catalog` catg
+on b.sku=catg.sku)
+where partner_code IN ('CAI04',
+'CAI09',
+'CAI10',
+'CAI11') or partner_code like ('%G%')
+and partner_code not like ('%PKG%')
+--and id_partner not in (9401,9404,9601)
+)where category='grocery'),
+
+
+SKU_catalog_all as 
+(select *
+from 
+(
+select sku , 
+coalesce(comcat_code,commercial_reporting_category,reporting_category_parent,"Null") as category,
+title_en,
+product_type,
+product_subtype,
+family,
+cluster_name
+from 
+`noonbigrowth.assortment_noon.catalog` catg
+where 
+product_type in ('nutrition','vitamins_dietary_supplements','sports_nutrition')  
+ or sku in (select sku from noonbicompl.supply_planning.sku_health_exception)))
+
+,
+SKU_catalog_all_diapers as 
+(select *
+from 
+(
+select sku , 
+coalesce(comcat_code,commercial_reporting_category,reporting_category_parent,"Null") as category,
+title_en,
+product_type,
+product_subtype,
+family,
+cluster_name
+from 
+`noonbigrowth.assortment_noon.catalog` catg
+where 
+product_type in ('diaper'))
+where sku not in ('Z5F58DFF492458232BD16Z-1',
+'Z6DA8629046B6301DEEFCZ-1'))
+,
+SKU_catalog_all_baby_consumables as 
+(select *
+from 
+(
+select sku , 
+coalesce(comcat_code,commercial_reporting_category,reporting_category_parent,"Null") as category,
+title_en,
+product_type,
+product_subtype,
+family,
+cluster_name
+from 
+`noonbigrowth.assortment_noon.catalog` catg
+where 
+comcat_code in ('baby_consumables')))
+
+
+,
+SKU_catalog_ceiling_fans as 
+(select *
+from 
+(
+select sku , 
+coalesce(comcat_code,commercial_reporting_category,reporting_category_parent,"Null") as category,
+title_en,
+product_type,
+product_subtype,
+family,
+cluster_name
+from 
+`noonbigrowth.assortment_noon.catalog` catg
+where 
+product_subtype in ('ceiling_fans')))
+
+,
+SKU_catalog_pedestal_fans as 
+(select *
+from 
+(
+select sku , 
+coalesce(comcat_code,commercial_reporting_category,reporting_category_parent,"Null") as category,
+title_en,
+product_type,
+product_subtype,
+family,
+cluster_name
+from 
+`noonbigrowth.assortment_noon.catalog` catg
+where 
+product_subtype in ('pedestal_fans')))
+
+,dimensions as 
+	(select a.* ,(length+2*(height+width)) as girth from 
+	(
+	select 
+	DISTINCT(COALESCE(nsku, zsku, pbarcode_canonical)) as sku,
+	--pf.product_fulltype_code,
+	wb.weight weight, 
+	wb.longest_side length,
+	wb.median_side width,
+	wb.shortest_side height,
+	wb.volumetric_weight volumetric_weight,
+	wb.size_classification,
+	(volumetric_weight*5000/28317) cubic_feet
+	from noonbitechsc.vms.vms_pbarcode_cache wb 
+	--LEFT JOIN noonbicedata.psku_v1.content_sku pf on (COALESCE(wb.nsku, wb.zsku, wb.pbarcode_canonical)=content_sku)
+	--where weight is not null
+	--limit 100
+	)a
+	where sku is not null 
+	)
+
+,
+SKU_catalog_regional_pst as 
+((select *
+from 
+(
+select catg.sku , 
+coalesce(comcat_code,commercial_reporting_category,reporting_category_parent,"Null") as category,
+title_en,
+product_type,
+product_subtype,
+family,
+cluster_name,
+d.size_classification
+from 
+`noonbigrowth.assortment_noon.catalog` catg
+left join 
+dimensions d
+on catg.sku=d.sku
+where 
+product_subtype in (select product_subtype from noonbicompl.supply_planning.bulky_sku_pst_exception group by 1)
+and d.size_classification in ('extra_oversize','bulky')
+and d.length is not null
+and comcat_code not in ('apparel','footwear')
+and catg.sku not in ('N49462158A')
+))
+union all  
+(select *
+from 
+(
+select catg.sku , 
+coalesce(comcat_code,commercial_reporting_category,reporting_category_parent,"Null") as category,
+title_en,
+product_type,
+product_subtype,
+family,
+cluster_name,
+d.size_classification
+from 
+`noonbigrowth.assortment_noon.catalog` catg
+left join 
+dimensions d
+on catg.sku=d.sku
+where 
+product_subtype not in ('televisions')
+and d.length is not null
+and d.size_classification in ('extra_oversize','bulky')
+and  (girth>360 or  weight>30)
+and comcat_code not in ('apparel','footwear')
+)))
+
+, sku_bulky_national as 
+(select *
+from 
+(
+select catg.sku , 
+coalesce(comcat_code,commercial_reporting_category,reporting_category_parent,"Null") as category,
+title_en,
+product_type,
+product_subtype,
+family,
+cluster_name,
+d.size_classification
+from 
+`noonbigrowth.assortment_noon.catalog` catg
+left join 
+dimensions d
+on catg.sku=d.sku
+where d.size_classification in ('extra_oversize','bulky')
+and d.length is not null
+and product_subtype not in ('televisions')
+and comcat_code not in ('apparel','footwear')
+and catg.sku not in (select sku from SKU_catalog_regional_pst group by 1)
+and catg.sku not in ('Z89BA956617AF3DB2341AZ-1')
+))
+
+
+,
+SKU_catalog_large_appliance as 
+(select *
+from 
+(
+select catg.sku , 
+coalesce(comcat_code,commercial_reporting_category,reporting_category_parent,"Null") as category,
+title_en,
+product_type,
+product_subtype,
+family,
+cluster_name,
+d.size_classification
+from 
+`noonbigrowth.assortment_noon.catalog` catg
+left join 
+dimensions d
+on catg.sku=d.sku
+where 
+product_subtype in ('cooking_range',
+'refrigerator',
+'dish_washer',
+'washing_machine',
+'air_conditioner')
+and d.size_classification in ('extra_oversize','bulky')
+))
+,
+SKU_catalog_all_engine_oil as 
+(select *
+from 
+(
+select sku , 
+coalesce(comcat_code,commercial_reporting_category,reporting_category_parent,"Null") as category,
+title_en,
+product_type,
+product_subtype,
+family,
+cluster_name
+from 
+`noonbigrowth.assortment_noon.catalog` catg
+where 
+product_subtype in ('engine_oil')))
+
+
+select a.*, 
+'0' as is_primary,
+'1' as is_active
+from 
+(select * from (
+(select country , sku ,product_type,category,
+case 
+--when (partner_code like ('%DXBG%') or category not in ('grocery')) and country ='AE' then 'DXBG02'
+when (partner_code like ('%G%') or category not in ('grocery') ) and country ='SA' then 'RUH08'
+else partner_code end as WH 
+from 
+SKU_catalog
+where partner_code not like ('%DXBG%') )
+union all 
+(select 'AE' as country , sku ,product_type,category,
+'DXB08' as  WH 
+from 
+SKU_catalog_all)
+
+union all 
+(select 'AE' as country , sku ,product_type,category,
+'DXBG02' as  WH 
+from 
+SKU_catalog_all)
+
+union all 
+(select 'SA' as country , sku ,product_type,category,
+'RUH10' as  WH 
+from 
+SKU_catalog_all)
+union all 
+(select 'SA' as country , sku ,product_type,category,
+'RUH10' as  WH 
+from 
+SKU_catalog_all_diapers)
+
+union all 
+(select 'SA' as country , sku ,product_type,category,
+'RUHBK07' as  WH 
+from 
+SKU_catalog_large_appliance)
+
+union all 
+(select 'AE' as country , sku ,product_type,category,
+'DXBBK06' as  WH 
+from 
+SKU_catalog_large_appliance)
+
+union all 
+(select 'AE' as country , sku ,product_type,category,
+'DXBBK09IS' as  WH 
+from 
+SKU_catalog_large_appliance)
+
+union all 
+(select 'SA' as country , sku ,product_type,category,
+'JEDBK06' as  WH 
+from 
+SKU_catalog_large_appliance)
+
+union all 
+(select 'SA' as country , sku ,product_type,category,
+'RUHBK07' as  WH 
+from 
+SKU_catalog_regional_pst)
+
+union all 
+(select 'AE' as country , sku ,product_type,category,
+'DXBBK06' as  WH 
+from 
+SKU_catalog_regional_pst)
+
+union all 
+(select 'AE' as country , sku ,product_type,category,
+'DXBBK09IS' as  WH 
+from 
+SKU_catalog_regional_pst)
+
+union all 
+(select 'SA' as country , sku ,product_type,category,
+'JEDBK06' as  WH 
+from 
+SKU_catalog_regional_pst)
+
+union all 
+(select 'SA' as country , sku ,product_type,category,
+'RUHBK10' as  WH 
+from 
+sku_bulky_national)
+
+union all 
+(select 'AE' as country , sku ,product_type,category,
+'DXBBK08' as  WH 
+from 
+sku_bulky_national)
+
+union all 
+(select 'AE' as country , sku ,product_type,category,
+'DXBBK09' as  WH 
+from 
+sku_bulky_national)
+
+union all 
+(select 'SA' as country , sku ,product_type,category,
+'JEDBK07' as  WH 
+from 
+sku_bulky_national)
+
+
+union all 
+(select 'EG' as country , sku ,product_type,category,
+'CAIFLX09' as  WH 
+from 
+SKU_catalog_ceiling_fans)
+
+union all 
+(select 'EG' as country , sku ,product_type,category,
+'CAIFLX09' as  WH 
+from 
+SKU_catalog_pedestal_fans)
+
+union all 
+(select 'EG' as country , sku ,product_type,category,
+'CAI16' as  WH 
+from 
+SKU_catalog_ceiling_fans)
+
+union all 
+(select 'EG' as country , sku ,product_type,category,
+'CAI16' as  WH 
+from 
+SKU_catalog_pedestal_fans)
+
+)f
+join (select code as partner_code from `noondwh.wms.warehouse` where is_seller_flex <> 1
+group by 1
+) sl  on sl.partner_code = f.WH
+ )a 
+ ---where  sku not in(select sku from base where partner_code  in ('DXB05','RUH07') )
+ ---and category <>'grocery'
+union all 
+ select * except(is_primary,is_active),'0' as is_primary,
+'1' as is_active from noonbicompl.supply_planning.TV_Routing_based
+where sku is not null
+union all 
+ select * except(is_primary,is_active),'0' as is_primary,
+'1' as is_active from noonbicompl.supply_planning.TV_Routing_based_categ_inputs
+where sku is not null
+union all 
+select a.country,a.sku,b.product_type,b.comcat_code as category,a.WH, partner_code,'0' as is_primary,
+'1' as is_active from noonbicompl.supply_planning.grocery_eg_exception a
+left join `noonbigrowth.assortment_noon.catalog` b
+on a.sku=b.sku
+where b.comcat_code='grocery'
+and a.sku is not null
+and a.sku not in ('ZD94E88A612418B5DD271Z-1')
+
+
+
+'''
+
+[[sheetstobq]]
+dag_id = 'per_storage'
+task_id = 'wh_routing_transfer'
+destination_table = 'noonbicompl.supply_planning.wh_mapping_asn_routing_priority'
+
+sheet_url = 'https://docs.google.com/spreadsheets/d/1wx9wWbfgf2ExzOxqcYkMU4gzDvWqNc3qVL1Aues53YY/edit#gid=1439664522'
+tabname = "WH_Priritization_Allowed_Mapping"
+schema=[
+{type='INT64', name='Sno'},
+{type='STRING', name='country'},
+{type='STRING', name='partner_code'},
+{type='STRING', name='city'},
+{type='STRING', name='storage_type_code'},
+{type='INT64', name='is_primary'},
+{type='INT64', name='is_allowed'},
+{type='INT64', name='is_transfer'},
+]
+
+
+[[sheetstobq]]
+dag_id = 'per_storage'
+task_id = 'wh_multi_factor_perfmax'
+destination_table = 'noonbicompl.supply_planning.wh_multi_factor_perfmax'
+
+sheet_url = 'https://docs.google.com/spreadsheets/d/1wx9wWbfgf2ExzOxqcYkMU4gzDvWqNc3qVL1Aues53YY/edit#gid=1439664522'
+tabname = "WH_Storage_Multi"
+schema=[
+{type='STRING', name='country'},
+{type='STRING', name='Storage_Type'},
+{type='STRING', name='Storage_Type_WHBased'},
+{type='INT64', name='Perf_Storage_before_Correction'},
+{type='INT64', name='Perf_Storage_Space_Cub_Feet_Based_on_VMS'},
+{type='STRING', name='Units_all'},
+{type='STRING', name='Perf_Storage_Units'},
+{type='STRING', name='CBFT_Perf_Stroage'},
+{type='INT64', name='Cubic_Feet_total_considered_mulitplication_Max'},
+{type='INT64', name='TotalStorage_Cubic_Feet'},
+{type='FLOAT64', name='Multi_factor_perf'},
+{type='FLOAT64', name='Max_Storage_Available_'},
+{type='INT64', name='Max_Stroage_for_Disc'},
+{type='FLOAT64', name='Multi_factor_disc'},
+]
+
+
+[[sheetstobq]]
+dag_id = 'per_storage'
+task_id = 'new_Seller_base_storage'
+destination_table = 'noonbicompl.supply_planning.new_Seller_base_storage'
+
+sheet_url = 'https://docs.google.com/spreadsheets/d/1wx9wWbfgf2ExzOxqcYkMU4gzDvWqNc3qVL1Aues53YY/edit#gid=1439664522'
+tabname = "Base_Numbers_New_Seller"
+schema=[
+{type='STRING', name='country'},
+{type='STRING', name='Storage_Type'},
+{type='FLOAT64', name='CBFT_Perf_Stroage'},
+{type='FLOAT64', name='Base_Number'},
+{type='FLOAT64', name='Base_Cubic_FT'},
+]
+
+
+[[sheetstobq]]
+dag_id = 'per_storage'
+task_id = 'disc_base'
+destination_table = 'noonbicompl.supply_planning.disc_base'
+
+sheet_url = 'https://docs.google.com/spreadsheets/d/1wx9wWbfgf2ExzOxqcYkMU4gzDvWqNc3qVL1Aues53YY/edit#gid=1439664522'
+tabname = "Base_disc"
+schema=[
+{type='FLOAT64', name='Sno'},
+{type='STRING', name='Storage_Type'},
+{type='FLOAT64', name='Disc_Min'},
+]
+
+
